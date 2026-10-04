@@ -8,11 +8,11 @@ import sqlite3
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 DATABASE = Path(os.environ.get("GATEWAY_DB", "gateway.sqlite3"))
@@ -30,15 +30,61 @@ class ClientCreate(BaseModel):
     budget_microusd: int = Field(gt=0)
 
 
+class FunctionCall(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    name: str = Field(min_length=1)
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    id: str = Field(min_length=1)
+    type: Literal['function'] = 'function'
+    function: FunctionCall
+
+
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    model_config = ConfigDict(extra='forbid')
+    role: Literal['system', 'user', 'assistant', 'tool']
+    content: str | None = None
+    tool_calls: list[ToolCall] | None = Field(default=None, min_length=1)
+    tool_call_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode='after')
+    def validate_message(self):
+        if self.role == 'tool' and not self.tool_call_id:
+            raise ValueError('Tool messages require tool_call_id')
+        if self.role != 'tool' and self.tool_call_id is not None:
+            raise ValueError('tool_call_id is only valid on tool messages')
+        if self.tool_calls and self.role != 'assistant':
+            raise ValueError('Only assistant messages may contain tool_calls')
+        if self.content is None and not (self.role == 'assistant' and self.tool_calls):
+            raise ValueError('Message content is required without assistant tool calls')
+        return self
+
+
+class ToolDefinition(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    type: Literal['function'] = 'function'
+    function: dict[str, Any]
+
+    @model_validator(mode='after')
+    def validate_function(self):
+        if not isinstance(self.function.get('name'), str) or not self.function['name'].strip():
+            raise ValueError('Tool definitions require a function name')
+        return self
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     model: str = Field(min_length=1)
     messages: list[ChatMessage] = Field(min_length=1)
     max_tokens: int = Field(default=512, ge=1, le=4096)
+    tools: list[ToolDefinition] | None = Field(default=None, min_length=1)
+    tool_choice: Literal['auto', 'none', 'required'] | dict[str, Any] | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    response_format: dict[str, Any] | None = None
+    stream: Literal[False] = False
 
 
 @contextmanager
@@ -144,7 +190,7 @@ def list_runs(authorization: str | None = Header(default=None)) -> dict[str, Any
 
 
 def estimate_reservation(body: ChatRequest) -> int:
-    estimated_input = sum(len(message.content.encode("utf-8")) + 32 for message in body.messages)
+    estimated_input = len(body.model_dump_json(exclude_none=True).encode('utf-8')) + 32 * len(body.messages)
     input_cost = estimated_input * INPUT_MICROUSD_PER_MILLION
     output_cost = body.max_tokens * OUTPUT_MICROUSD_PER_MILLION
     return max(1, (input_cost + output_cost + 999_999) // 1_000_000)
@@ -166,7 +212,7 @@ async def call_upstream(body: ChatRequest) -> dict[str, Any]:
         response = await http.post(
             UPSTREAM_URL.rstrip("/") + "/chat/completions",
             headers={"Authorization": f"Bearer {UPSTREAM_KEY}"},
-            json=body.model_dump(),
+            json=body.model_dump(exclude_none=True),
         )
         response.raise_for_status()
         result = response.json()
