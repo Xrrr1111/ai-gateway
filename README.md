@@ -16,7 +16,7 @@ uvicorn backend.app:app --host 127.0.0.1 --port 8100
 
 In another terminal, `cd frontend`, run `npm install`, then `npm run dev`. The console opens at `http://127.0.0.1:5173` or the next free Vite port. The browser holds the admin token in memory only; refresh clears it.
 
-Clients call `POST /v1/chat/completions` with `Authorization: Bearer <issued-key>` and `Idempotency-Key: <unique-request-id>`. The upstream key never goes to the browser. Run `pytest` from this directory.
+Clients call `POST /v1/chat/completions` with `Authorization: Bearer <issued-key>` and `Idempotency-Key: <unique-request-id>`. Every response includes an `X-Request-ID`; clients may provide a short trace-safe value or let the gateway generate one. The ID is stored with the run record and is safe to use when correlating support logs. The upstream key never goes to the browser. Run `pytest` from this directory.
 
 ## Agent compatibility
 

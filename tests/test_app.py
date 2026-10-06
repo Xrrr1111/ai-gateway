@@ -47,6 +47,7 @@ def test_auth_budget_and_idempotency(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway, "call_upstream", upstream)
     first = request(client, key)
     assert first.status_code == 200
+    assert first.headers["X-Request-ID"]
     assert request(client, key).json() == first.json()
     assert len(calls) == 1
     assert request(client, key, message="different").status_code == 409
@@ -54,6 +55,28 @@ def test_auth_budget_and_idempotency(tmp_path, monkeypatch):
     assert row["spent_microusd"] > 0
     assert row["reserved_microusd"] == 0
     assert "key_hash" not in row
+    runs = client.get("/admin/runs", headers={"Authorization": "Bearer admin-secret"}).json()["runs"]
+    assert runs[0]["request_id"] == first.headers["X-Request-ID"]
+
+
+def test_request_id_is_preserved_or_generated(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    key = issue_key(client)
+
+    async def upstream(body):
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    monkeypatch.setattr(gateway, "call_upstream", upstream)
+    supplied = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Idempotency-Key": "request-id-test", "X-Request-ID": "agent.step-42"},
+        json={"model": "test", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert supplied.status_code == 200
+    assert supplied.headers["X-Request-ID"] == "agent.step-42"
+    generated = client.get("/health")
+    assert gateway.REQUEST_ID_PATTERN.fullmatch(generated.headers["X-Request-ID"])
+    assert generated.headers["X-Request-ID"] != supplied.headers["X-Request-ID"]
 
 
 def test_failure_refunds_reservation(tmp_path, monkeypatch):

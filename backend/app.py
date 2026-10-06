@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -23,6 +25,7 @@ INPUT_MICROUSD_PER_MILLION = int(os.environ.get("INPUT_MICROUSD_PER_MILLION", "1
 OUTPUT_MICROUSD_PER_MILLION = int(os.environ.get("OUTPUT_MICROUSD_PER_MILLION", "600000"))
 
 app = FastAPI(title="AI Gateway", version="0.1.0")
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 
 
 class ClientCreate(BaseModel):
@@ -115,6 +118,7 @@ def init_database() -> None:
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY,
                 client_id INTEGER NOT NULL REFERENCES clients(id),
+                request_id TEXT NOT NULL DEFAULT '',
                 idempotency_key TEXT NOT NULL,
                 request_hash TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -127,12 +131,26 @@ def init_database() -> None:
             );
             """
         )
+        columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+        if "request_id" not in columns:
+            db.execute("ALTER TABLE runs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''")
         db.commit()
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_database()
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id or not REQUEST_ID_PATTERN.fullmatch(request_id):
+        request_id = uuid.uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 def require_admin(authorization: str | None) -> None:
@@ -184,7 +202,7 @@ def list_runs(authorization: str | None = Header(default=None)) -> dict[str, Any
     require_admin(authorization)
     with connection() as db:
         rows = db.execute(
-            "SELECT id,client_id,status,cost_microusd,error,created_at FROM runs ORDER BY id DESC LIMIT 100"
+            "SELECT id,client_id,request_id,status,cost_microusd,error,created_at FROM runs ORDER BY id DESC LIMIT 100"
         ).fetchall()
     return {"runs": [dict(row) for row in rows]}
 
@@ -224,6 +242,7 @@ async def call_upstream(body: ChatRequest) -> dict[str, Any]:
 @app.post("/v1/chat/completions")
 async def chat(
     body: ChatRequest,
+    request: Request,
     authorization: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -252,8 +271,8 @@ async def chat(
         if updated.rowcount != 1:
             raise HTTPException(402, "Budget exhausted")
         run = db.execute(
-            "INSERT INTO runs(client_id,idempotency_key,request_hash,status,reserved_microusd) VALUES(?,?,?,?,?)",
-            (client["id"], idempotency_key, request_hash, "running", reserve),
+            "INSERT INTO runs(client_id,request_id,idempotency_key,request_hash,status,reserved_microusd) VALUES(?,?,?,?,?,?)",
+            (client["id"], request.state.request_id, idempotency_key, request_hash, "running", reserve),
         )
         run_id = run.lastrowid
         db.commit()
